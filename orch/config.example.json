@@ -1,0 +1,17 @@
+{
+  "timeout_sec": 3,
+  "defaults": {
+    "transport": "auto",
+    "streams": 0,
+    "chunk_size": 0
+  },
+  "endpoints": [
+    { "name": "A1", "grpc_addr": "10.0.0.11:50051" },
+    { "name": "A2", "grpc_addr": "10.0.0.12:50051" },
+    { "name": "A3", "grpc_addr": "10.0.0.13:50051" },
+    { "name": "B1", "grpc_addr": "10.0.0.21:50051" },
+    { "name": "B2", "grpc_addr": "10.0.0.22:50051" },
+    { "name": "B3", "grpc_addr": "10.0.0.23:50051" }
+  ],
+  "tasks": []
+}

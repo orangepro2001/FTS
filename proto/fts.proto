@@ -1,0 +1,99 @@
+// fts gRPC proto(api-spec 7.2 的 P5 子集 + W1 ReserveInbox)。
+// 字段编号沿用 api-spec;新增字段用新 tag。
+syntax = "proto3";
+package fts.v1;
+
+service Fts {
+  rpc Capabilities(Empty) returns (CapabilitiesReply);
+  // W1:预注册接收目录 → 一次性/目录 token
+  rpc ReserveInbox(ReserveInboxRequest) returns (InboxToken);
+  // W6:危险操作 —— 清空 token 绑定目录的全部内容(仅目录模式 token;必须 force=true)
+  rpc PurgeInbox(PurgeRequest) returns (PurgeReply);
+  rpc Submit(TransferRequest) returns (TransferHandle);
+  rpc Observe(ObserveRequest) returns (stream TransferEvent);
+  rpc Status(TaskRef) returns (TransferStatus);
+  rpc Cancel(TaskRef) returns (Ack);
+  // W9:远程更新 —— 新版二进制已由调用方推入 staging_dir 后,daemon 自替换并重启。
+  // 仅在 Ack 返回后 ~1s 内退出;调用方随后轮询 Capabilities 等待新 fts_version。
+  rpc BeginUpdate(UpdateRequest) returns (Ack);
+}
+
+message Empty {}
+
+message CapabilitiesReply {
+  string protocol_version = 1;
+  uint32 capabilities = 2;
+  string fts_version = 3;
+  // 自描述:编排方(server)只凭 gRPC 地址即可完成编排,无需人工抄指纹/端口。
+  string fingerprint = 4;   // 数据监听证书 BLAKE3 hex(64 chars),供对端 pin
+  string listen_addr = 5;   // 数据监听地址(可能为 0.0.0.0:4433;host 部分由编排方替换)
+  uint64 started_at = 6;    // daemon 启动时刻(unix 秒);W9 远程更新后确认目标已重启
+}
+
+message NetworkCredential {
+  string user_name = 1;
+  string password = 2;
+  string domain = 3;   // 可选;仅 UNC 路径(\\host\share)有效
+}
+
+message ReserveInboxRequest {
+  string out_dir = 1;
+  // Some = 绑定精确文件名(一次性);空 = 目录模式(TTL 内可复用)
+  string file_name = 2;
+  // 可选:目标为需要认证的网络路径(SMB/UNC)时,fts 代为建立会话。
+  // 会话级(进程生命周期),不持久化、不写入任何日志。
+  NetworkCredential credential = 3;
+}
+
+message InboxToken {
+  string token = 1;
+  uint64 expires_in = 2;
+}
+
+message PurgeRequest {
+  string token = 1;   // 必须是目录模式 token(文件绑定 token 不允许 purge)
+  bool force = 2;     // 必须显式 true;false → INVALID_ARGUMENT
+}
+
+message PurgeReply {
+  uint64 files_deleted = 1;
+  uint64 directories_deleted = 2;
+}
+
+message TransferRequest {
+  repeated string paths = 1;      // 多文件(P5 W2)
+  string dst_addr = 4;
+  string fingerprint = 11;        // 空 + insecure=false → 拒绝
+  bool insecure = 12;
+  uint32 streams = 6;             // 0 = auto(4)
+  uint64 chunk_size = 7;          // 0 = auto(8 MiB)
+  string transport = 13;          // "" / "auto" / "quic" / "tcp"
+  string ticket = 14;             // W1
+}
+
+message TransferHandle { string task_id = 1; }
+message TaskRef { string task_id = 1; }
+message ObserveRequest { string task_id = 1; }
+
+message TransferEvent {
+  string raw_json = 1;  // NDJSON 事件原文(type/progress/file/file_done/path/degradation/result)
+}
+
+message TransferStatus {
+  string task_id = 1;
+  string state = 2;        // RUNNING | COMPLETED | FAILED | CANCELLED
+  bool checksum_ok = 3;
+  int32 error_code = 4;    // 仅 FAILED/CANCELLED
+  string error = 5;
+  string error_message = 6;
+}
+
+message Ack { bool ok = 1; }
+
+// W9:远程更新请求。staging_dir 内必须已含 fts.exe;
+// 默认不覆盖 config.json(除非显式列入 files)。
+message UpdateRequest {
+  string staging_dir = 1;
+  repeated string files = 2;
+  bool force = 3;   // true:存在 RUNNING 传输任务时也允许(默认拒绝)
+}

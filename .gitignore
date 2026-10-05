@@ -1,0 +1,16 @@
+/target
+/dist
+/.fts
+/.zcode
+/.demo/
+__pycache__/
+orch/fts_pb2.py
+orch/fts_pb2_grpc.py
+orch/config.local.json
+orch/config.json
+
+# updater GUI(构建产物与依赖,源码入库)
+updater/node_modules/
+updater/webdist/
+updater/src-tauri/target/
+updater/src-tauri/gen/

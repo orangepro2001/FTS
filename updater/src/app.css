@@ -1,0 +1,25 @@
+:root {
+  --bg: #0f1420;
+  --bg-panel: #161d2e;
+  --bg-hover: #1c2540;
+  --border: #26304a;
+  --text: #dce3f2;
+  --text-dim: #8b96ad;
+  --accent: #4f8cff;
+  --accent-hover: #6ba1ff;
+  --ok: #3ecf8e;
+  --warn: #ffb454;
+  --err: #ff6b6b;
+  --mono: "Cascadia Mono", Consolas, monospace;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #app { height: 100%; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 "Segoe UI", "Microsoft YaHei", sans-serif;
+  overflow: hidden;
+}

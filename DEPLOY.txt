@@ -1,0 +1,61 @@
+fts 部署说明(整个文件夹复制即可用)
+=====================================
+
+本目录内容:
+  fts.exe          主程序(CLI / daemon / start / stop / status)
+  fts.dll          C ABI 库(仅原生程序集成时需要)
+  fts.h            C 头文件(仅 C/C++ 集成时需要)
+  config.json      daemon 配置(端口/目录等,改完重启生效)
+  fts-daemon.cmd   cmd 下管理脚本(不受 PowerShell 执行策略限制)
+  fts-daemon.ps1   PowerShell 管理脚本(策略受限时用 .cmd 或 fts start)
+
+启动 / 停止 / 状态(cmd 或 PowerShell 都一样)
+---------------------------------------------
+  fts start          后台启动 daemon(自动读本目录 config.json,健康检查就绪才返回)
+  fts status         查看状态
+  fts stop           停止
+  fts daemon         前台运行(调试用,Ctrl+C 结束)
+
+日志:.fts\daemon.log / .fts\daemon.err.log
+PID 文件:.fts\daemon.pid
+
+发文件
+------
+  1. 接收端启动日志里有「证书指纹(blake3): <64位hex>」
+  2. 发送端:
+     fts send <文件...> --to <接收机IP>:4433 --fingerprint <指纹>
+     (UDP 被防火墙挡住时自动转 TCP;可加 --transport tcp 强制)
+
+程序集成(REST / gRPC)
+----------------------
+  REST:  http://127.0.0.1:5050/v1/capabilities
+  gRPC:  127.0.0.1:50051(proto 见源码仓库 proto/fts.proto)
+  完整接口文档见源码仓库 API.md。
+
+远程更新(不拷文件夹,填 IP 直接换版)
+--------------------------------------
+  前提(每台主机仅一次):本目录 daemon 已支持 W9(即本版本起自带),旧版本需
+  先按老方式拷贝部署一次,之后即可远程更新,不再手工杀进程。
+  要求:目标机 gRPC 端口(默认 50051)可达;发起方持有新版 dist 文件夹。
+
+  命令行:
+    fts push-update --to <目标IP> --dist <新版dist目录>
+    (可选:--overwrite-config 连 config.json 一起覆盖;--force 有传输任务也更新)
+
+  图形界面:开发机构建 .\build.ps1 -Updater,产物 fts-updater.exe,
+    填 IP → 检查 → 更新(支持批量),过程日志实时可见。
+
+  更新过程:新版文件推到目标机 .fts\update\stage-<ts>\ → 目标 daemon 自替换重启
+  (自动备份/回滚,日志在目标机 .fts\update\apply.log,结果在 result.json)。
+  默认不覆盖目标机 config.json。
+
+  安全提示:gRPC 控制面无鉴权,BeginUpdate 等于允许内网机器远程替换本机程序,
+  仅应在可信内网使用(与无鉴权文件推送同级风险)。
+
+常见问题
+--------
+  - PowerShell 提示"无法加载脚本"(执行策略):用 fts start 或 fts-daemon.cmd,
+    不需要改系统执行策略。
+  - 目标目录是网络路径(\\NAS\share):先用 cmdkey 建凭据,或经
+    ReserveInbox 的 credential 字段由集成方提供(见 API.md 5.3)。
+  - 端口被占用:改 config.json 后 fts restart(或 stop + start)。
