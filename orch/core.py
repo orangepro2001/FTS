@@ -308,6 +308,16 @@ class Orchestrator:
                         ORCH_ERR_UNREACHABLE,
                         "HOST_UNREACHABLE",
                     )
+            # 1.5) 协议版本:orch 是控制面,不参与数据面;只要求两端一致,
+            # 不硬编码具体版本号(否则每次协议升级编排层都会误报)。
+            # 数据面的真正兼容性由两端 daemon 握手自裁决。
+            if src.protocol_version != dst.protocol_version:
+                raise OrchestrationError(
+                    f"两端 fts 协议版本不一致: {src.name}=v{src.protocol_version}({src.fts_version}) "
+                    f"vs {dst.name}=v{dst.protocol_version}({dst.fts_version});请将两端升级到同一版本",
+                    ORCH_ERR_GENERIC,
+                    "PROTOCOL_MISMATCH",
+                )
             if not dst.data_addr:
                 raise OrchestrationError(
                     f"主机 {dst.name} 未上报数据监听地址,无法确定传输目标",
