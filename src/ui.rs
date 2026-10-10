@@ -46,8 +46,19 @@ impl Output {
 pub struct Progress {
     pub bytes_done: u64,
     pub bytes_total: u64,
+    /// v2 作业级聚合(additive 附加字段;None = 不输出 job 键)
+    pub job: Option<JobProgress>,
 }
 
+/// v2 作业级进度(文件级并发时聚合整个任务)
+pub struct JobProgress {
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub files_done: u64,
+    pub files_total: u64,
+}
+
+#[derive(Clone)]
 pub struct SessionOut {
     pub out: Output,
     pub task_id: String,
@@ -125,11 +136,18 @@ impl SessionOut {
             None
         };
         let json = format!(
-            r#"{{"type":"progress","bytes_done":{},"bytes_total":{},"throughput_bps":{},"eta_seconds":{}}}"#,
+            r#"{{"type":"progress","bytes_done":{},"bytes_total":{},"throughput_bps":{},"eta_seconds":{}{}}}"#,
             p.bytes_done,
             p.bytes_total,
             throughput,
-            eta.map(|v| v.to_string()).unwrap_or_else(|| "null".into())
+            eta.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
+            match &p.job {
+                Some(j) => format!(
+                    r#","job":{{"bytes_done":{},"bytes_total":{},"files_done":{},"files_total":{}}}"#,
+                    j.bytes_done, j.bytes_total, j.files_done, j.files_total
+                ),
+                None => String::new(),
+            }
         );
         match self.out {
             Output::Human => {}

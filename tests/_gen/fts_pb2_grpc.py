@@ -69,6 +69,11 @@ class FtsStub:
                 request_serializer=fts__pb2.TaskRef.SerializeToString,
                 response_deserializer=fts__pb2.Ack.FromString,
                 _registered_method=True)
+        self.BeginUpdate = channel.unary_unary(
+                '/fts.v1.Fts/BeginUpdate',
+                request_serializer=fts__pb2.UpdateRequest.SerializeToString,
+                response_deserializer=fts__pb2.Ack.FromString,
+                _registered_method=True)
 
 
 class FtsServicer:
@@ -118,6 +123,14 @@ class FtsServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def BeginUpdate(self, request, context):
+        """W9:远程更新 —— 新版二进制已由调用方推入 staging_dir 后,daemon 自替换并重启。
+        仅在 Ack 返回后 ~1s 内退出;调用方随后轮询 Capabilities 等待新 fts_version。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_FtsServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -154,6 +167,11 @@ def add_FtsServicer_to_server(servicer, server):
             'Cancel': grpc.unary_unary_rpc_method_handler(
                     servicer.Cancel,
                     request_deserializer=fts__pb2.TaskRef.FromString,
+                    response_serializer=fts__pb2.Ack.SerializeToString,
+            ),
+            'BeginUpdate': grpc.unary_unary_rpc_method_handler(
+                    servicer.BeginUpdate,
+                    request_deserializer=fts__pb2.UpdateRequest.FromString,
                     response_serializer=fts__pb2.Ack.SerializeToString,
             ),
     }
@@ -345,6 +363,33 @@ class Fts:
             target,
             '/fts.v1.Fts/Cancel',
             fts__pb2.TaskRef.SerializeToString,
+            fts__pb2.Ack.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def BeginUpdate(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/fts.v1.Fts/BeginUpdate',
+            fts__pb2.UpdateRequest.SerializeToString,
             fts__pb2.Ack.FromString,
             options,
             channel_credentials,

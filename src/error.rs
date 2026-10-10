@@ -75,7 +75,19 @@ impl FtsError {
     /// 重点翻译网络路径(SMB/UNC)常见错误:fts 不弹凭据框(CLI/服务程序),
     /// 凭据须由调用方预先建立(cmdkey / net use / 域环境自动)。
     pub fn io_with_hint(e: std::io::Error) -> FtsError {
-        let hint = match e.raw_os_error() {
+        // std 的 create_dir_all 等会给错误包 context("failed to create whole tree"),
+        // OS 错误码在链里。注意:io::Error::source() 不透传内层(标准库怪癖),
+        // 要用 get_ref() 逐层下探。
+        let mut cur = Some(&e);
+        let mut os_code = None;
+        while let Some(err) = cur {
+            if let Some(c) = err.raw_os_error() {
+                os_code = Some(c);
+                break;
+            }
+            cur = err.get_ref().and_then(|inner| inner.downcast_ref::<std::io::Error>());
+        }
+        let hint = match os_code {
             Some(5) => Some("拒绝访问:确认共享与 NTFS 权限;若凭据缺失见 1326 的处理"),
             Some(1326) => Some(
                 "登录失败(凭据无效或未提供):网络路径请先建立凭据 —— \
@@ -109,6 +121,14 @@ mod tests {
         let e = std::io::Error::from_raw_os_error(5);
         let msg = FtsError::io_with_hint(e).to_string();
         assert!(msg.contains("权限"), "应包含权限提示: {msg}");
+        // context 包裹(source 链)的 OS 错误也要能翻译(create_dir_all 风格):
+        // new(外层消息, 内层 io::Error) → 内层成为 source
+        let e = std::io::Error::new(
+            std::io::ErrorKind::Other,
+            std::io::Error::from_raw_os_error(67),
+        );
+        let msg = FtsError::io_with_hint(e).to_string();
+        assert!(msg.contains("网络路径"), "source 链中的 OS 错误应被翻译: {msg}");
         let e = std::io::Error::from_raw_os_error(2); // 无提示的普通错误
         let msg = FtsError::io_with_hint(e).to_string();
         assert!(!msg.contains("提示"), "无映射错误不应带提示: {msg}");

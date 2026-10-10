@@ -69,6 +69,7 @@ message TransferRequest {
   uint64 chunk_size = 7;          // 0 = auto(8 MiB)
   string transport = 13;          // "" / "auto" / "quic" / "tcp"
   string ticket = 14;             // W1
+  uint32 file_concurrency = 15;   // v2 文件级并发;0 = auto(4)
 }
 
 message TransferHandle { string task_id = 1; }

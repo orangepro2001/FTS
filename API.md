@@ -259,6 +259,7 @@ rpc Submit(TransferRequest) returns (TransferHandle)
 | chunk_size | uint64 | — | 分块字节,0 = 8 MiB |
 | transport | string | — | `""`/`auto`/`quic`/`tcp` |
 | ticket | string | — | inbox token |
+| file_concurrency | uint32 | — | 文件级并发,0 = 自动 4(clamp 1..=16);仅 QUIC 且对端支持时生效,TCP 自动串行 |
 
 | 响应字段 | 类型 |
 |---|---|
@@ -430,9 +431,10 @@ curl.exe http://127.0.0.1:5050/v1/transfers/$($t.task_id)/events     # SSE
 
 ```text
 fts send <PATH>... --to <ADDR> [--fingerprint <HEX> | --insecure]
-        [--chunk-size <B>=8MiB] [--streams <N>=4] [--ticket <T>]
-        [--transport auto|quic|tcp] [--json] [-v]
-    PATH  文件或目录(可多个;目录展开直接文件,不递归;展开后重名 → 退出码 2)
+        [--chunk-size <B>=8MiB] [--streams <N>=4] [--file-concurrency <N>=0自动4]
+        [--ticket <T>] [--transport auto|quic|tcp] [--json] [-v]
+    PATH  文件或目录(可多个;目录递归展开保留相对结构;展开后重名 → 退出码 2)
+    --file-concurrency  0 = 自动 4:QUIC 且对端支持时多文件流水线,TCP 自动串行
 
 fts recv --listen <ADDR> [--out <DIR>=.] [--transport auto|quic|tcp]
         [--cert-cache <DIR>=.fts] [--json] [-v]

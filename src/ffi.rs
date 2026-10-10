@@ -122,6 +122,7 @@ pub unsafe extern "C" fn fts_send_file(
         ticket: None,
         out: Output::Silent,
         events: None,
+        file_concurrency: 0,
     };
 
     match rt().block_on(crate::send::run_send(cfg)) {

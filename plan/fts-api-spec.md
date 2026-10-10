@@ -878,6 +878,40 @@ message CapabilitiesReply {
 - 断线不视为失败——若 `resume_supported`,接收端保存 checkpoint 并等待重连;
 - 版本不匹配 → `Error{code=INCOMPATIBLE_VERSION}` + `Bye`。
 
+### 8.9 v2 修订(fts-more-fast,文件级并发流水线)
+
+`PROTOCOL_VERSION = 2`。v1 → v2 全部**附加式**变更;Sequential 模式字节级与 v1 相同。
+
+**Hello.caps(新增,`#[serde(default)]`)**:能力位图,bit0 = MULTIFILE(支持槽位化多文件流水线)。双方各自推导模式,无额外协商帧:
+
+```
+Concurrent ⇔ 传输层为 QUIC 且对端 caps.bit0 = 1
+其余(TCP 回退 / 能力缺失)→ Sequential(v1 语义)
+```
+
+**控制帧 slot(可选字段)**:`Manifest` / `ManifestAck` / `Finish` / `FinishAck` 各加 `slot: Option<u32>`,`skip_serializing_if = "Option::is_none"` —— 为 None 时序列化输出与 v1 逐字节相同。Concurrent 模式下全部携带 slot(0..K,K = 同时在途文件数,sender 端 worker 固定占槽)。
+
+**数据流 v2 前导**:Concurrent 模式下每条数据流以 4 字节槽位前导开头:
+
+```
+┌──────────┬──────────┬──────────┬──────────┬─────────────┐
+│ slot u32 │ chunk_id │ offset   │ len      │ payload     │
+│ (LE)     │ u32      │ u64      │ u32      │ len bytes   │
+└──────────┴──────────┴──────────┴──────────┴─────────────┘
+```
+
+Sequential 模式数据流无前导(与 v1 相同)。接收端按前导把流路由到对应槽的会话状态(逐块哈希校验 / 续传位图 / checkpoint 每槽独立)。
+
+**作业级进度(progress 事件附加字段)**:文件级并发时 `progress` 事件追加 `job` 对象(additive,旧消费者忽略):
+
+```jsonc
+{"type":"progress", ..., "job":{"bytes_done":..,"bytes_total":..,"files_done":..,"files_total":..}}
+```
+
+**hash-ahead**:发送端后台顺序预读+哈希文件队列(容量 K+1),把预读藏进前一文件的传输窗口;每文件仍是两遍读(单遍哈希见"非目标")。
+
+**接口**:CLI `--file-concurrency`(0 = 自动 4);gRPC `TransferRequest.file_concurrency = 15`(0 = 自动,clamp 1..=16);REST `SubmitReq.file_concurrency`;config `quic_window_mib`(QUIC 接收窗口 MiB,默认 32)。
+
 ---
 
 ## 9. 事件与错误模型

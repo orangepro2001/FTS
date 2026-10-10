@@ -83,7 +83,7 @@ pub fn establish_connection(out_dir: &str, cred: &NetworkCredential) -> Result<(
             "网络登录失败(1326):用户名/密码/域不正确".into(),
         )),
         5 => Err(FtsError::Auth("网络访问被拒绝(5):账号无该共享权限".into())),
-        53 | 67 => Err(FtsError::Connect(format!(
+        53 | 67 | 1203 => Err(FtsError::Connect(format!(
             "找不到网络路径({rc}):主机或共享名错误,或网络不通({remote})"
         ))),
         other => Err(FtsError::Auth(format!(

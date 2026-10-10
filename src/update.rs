@@ -167,6 +167,7 @@ pub async fn push_update(cfg: PushUpdateCfg) -> UpdateReport {
         ticket: Some(token),
         out: crate::ui::Output::Silent,
         events: Some(tx.clone()),
+        file_concurrency: 0,
     })
     .await;
     drop(tx);

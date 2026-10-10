@@ -16,7 +16,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 发送文件(多路径/目录;目录展开为其中直接文件,不递归,展开后不得重名)
+    /// 发送文件(多路径/目录;目录递归展开并保留相对路径结构,展开后不得重名)
     Send {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
@@ -34,6 +34,9 @@ enum Cmd {
         /// 并行流数
         #[arg(long, default_value_t = 4)]
         streams: u32,
+        /// 文件级并发(0 = 自动 4;仅 QUIC 且对端支持时生效,TCP 自动串行)
+        #[arg(long, default_value_t = 0)]
+        file_concurrency: u32,
         /// inbox 预注册票据(daemon REST/gRPC 获取;决定对端落盘目录)
         #[arg(long)]
         ticket: Option<String>,
@@ -157,6 +160,7 @@ async fn main() -> ExitCode {
             insecure,
             chunk_size,
             streams,
+            file_concurrency,
             ticket,
             json,
             transport,
@@ -191,6 +195,7 @@ async fn main() -> ExitCode {
                 ticket,
                 out,
                 events: None,
+                file_concurrency,
             })
             .await
         }
@@ -204,6 +209,7 @@ async fn main() -> ExitCode {
                 cert_cache,
                 events: None,
                 inbox: None,
+                quic_window_mib: 32,
             })
             .await
         }
@@ -280,6 +286,7 @@ fn build_daemon_cfg(
     let out_dir = out.or(fc.out_dir).unwrap_or_else(|| PathBuf::from("."));
     let cert_cache = cert_cache.or(fc.cert_cache).unwrap_or_else(|| PathBuf::from(".fts"));
     let max_sessions = max_sessions.or(fc.max_sessions).unwrap_or(3);
+    let quic_window_mib = fc.quic_window_mib.unwrap_or(32);
     let grpc_raw = grpc.or(fc.grpc_addr).unwrap_or_else(|| "127.0.0.1:50051".into());
     let grpc_addr = if grpc_raw.trim().is_empty() {
         None
@@ -297,6 +304,7 @@ fn build_daemon_cfg(
         grpc: grpc_addr,
         // W9:记录启动配置路径,BeginUpdate 拉起 apply-update 时透传给 fts start
         config_path: config.unwrap_or_default(),
+        quic_window_mib,
     })
 }
 

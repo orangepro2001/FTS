@@ -2,6 +2,10 @@
 //! 会话 = Hello ↔ Hello → N × (Manifest → 并行收流逐块校验落盘 → Finish → 校验 → 原子落盘 → FinishAck)。
 //! 续传:checkpoint(<name>.fts-part.meta)每秒落盘,重发同 manifest 自动只补缺失块。
 //!
+//! v2(fts-more-fast):QUIC 且对端 Hello.caps 宣告 MULTIFILE → Concurrent 会话:
+//! 控制帧带 slot,数据流带 4 字节槽位前导,按槽路由到独立 SlotHandle(HashMap);
+//! TCP 回退 / 能力缺失 → Sequential,字节级与 v1 相同,走原路径。
+//!
 //! 并发说明(规划 W3):QUIC 会话天然可并发;**TCP 会话全局互斥** —— TCP 回退模式下
 //! 数据流与新控制连接共享同一 listener,无法区分,故同一时间只允许一个 TCP 会话
 //! (其余排队)。这是刻意简化,见 plan/fts-p5-integration-design.md 第 4 节。
@@ -12,10 +16,11 @@ use crate::send::{BoxRead, BoxWrite};
 use crate::ui::{Output, Progress, SessionOut};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore};
@@ -42,6 +47,8 @@ pub struct RecvCfg {
     pub events: Option<tokio::sync::broadcast::Sender<String>>,
     /// W1 inbox 预注册表;None = 不支持 ticket(收到带 ticket 的传输即拒绝)
     pub inbox: Option<Arc<crate::inbox::InboxRegistry>>,
+    /// v2:QUIC 流/连接接收窗口(MiB;默认 32)
+    pub quic_window_mib: u32,
 }
 
 /// 监听器集合(绑定一次,反复 accept)
@@ -154,7 +161,7 @@ async fn bind(cfg: &RecvCfg, _out: &SessionOut) -> Result<Listeners> {
         let mut server_cfg = crate::tls::server_config(&cert)?;
         server_cfg.transport_config(Arc::new({
             let mut tc = quinn::TransportConfig::default();
-            let win = quinn::VarInt::from_u32(32 * 1024 * 1024);
+            let win = quinn::VarInt::from_u32(cfg.quic_window_mib.max(1) * 1024 * 1024);
             tc.stream_receive_window(win);
             tc.receive_window(win);
             tc
@@ -228,14 +235,15 @@ async fn handle_incoming(
             }
         };
 
-    let result = session_logic(cfg, out, ctrl_tx, ctrl_rx, &data_src).await;
+    let result = session_logic(cfg, out, ctrl_tx, ctrl_rx, data_src).await;
     match (&result, gate) {
         // QUIC:close 会丢弃未 ACK 的流数据。
-        // 成功路径:等发送端读完 FinishAck 后由它关闭;
-        // 错误路径:session 可能刚发完 deny/错误 Ack(如 ticket 拒绝)——给对端
-        // 2s 读走最后一条消息的机会,超时才强断(否则退出码语义丢失,只剩 connection lost)。
+        // 成功路径:等发送端读完 FinishAck 后由它关闭;正常发送端毫秒级完成。
+        // 但上界 30s 兜底 —— 客户端崩溃/消失时 quinn 默认无 idle timeout,
+        // 无界等待会永久占用会话 permit(max_sessions 会被拖死,见 fts-more-fast 实测)。
         (Ok(()), Some(conn)) => {
-            conn.closed().await;
+            let _ = tokio::time::timeout(Duration::from_secs(30), conn.closed()).await;
+            conn.close(0u32.into(), b"done");
         }
         (Err(_), Some(conn)) => {
             let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
@@ -249,28 +257,46 @@ async fn handle_incoming(
 async fn session_logic(
     cfg: &RecvCfg,
     out: &mut SessionOut,
-    mut ctrl_tx: BoxWrite,
+    ctrl_tx: BoxWrite,
     mut ctrl_rx: BoxRead,
-    data_src: &DataInSource,
+    data_src: DataInSource,
 ) -> Result<()> {
     let peer: Hello = parse_json(&read_frame(&mut ctrl_rx, 4096).await?)?;
     check_hello(&peer)?;
+    // 共享控制写端:Sequential 单人使用,Concurrent 各槽互斥整帧写
+    let ctl = Arc::new(Mutex::new(ctrl_tx));
+    let mode = negotiate_mode(matches!(data_src, DataInSource::Quic(_)), peer.caps);
     write_frame(
-        &mut ctrl_tx,
+        &mut *ctl.lock().await,
         &serde_json::to_vec(&Hello {
             protocol_version: PROTOCOL_VERSION,
             fts_version: env!("CARGO_PKG_VERSION").into(),
             role: "dest".into(),
+            caps: CAP_MULTIFILE,
         })?,
     )
     .await?;
 
+    match mode {
+        TransferMode::Concurrent => session_concurrent(cfg, out, ctl, ctrl_rx, data_src).await,
+        TransferMode::Sequential => session_sequential(cfg, out, ctl, ctrl_rx, data_src).await,
+    }
+}
+
+/// 串行会话(v1 原路径):Manifest/Ack/Finish/FinishAck 均无 slot,数据流无前导。
+async fn session_sequential(
+    cfg: &RecvCfg,
+    out: &mut SessionOut,
+    ctl: Arc<Mutex<BoxWrite>>,
+    mut ctrl_rx: BoxRead,
+    data_src: DataInSource,
+) -> Result<()> {
     // 常驻控制流读取任务:按帧类型分发(Manifest → manifest 通道;Finish → finish 通道)。
     // read_exact 取消不安全,不能直接放进 select!(否则帧被撕碎 —— P1 教训);
     // 也不能 per-file abort —— abort 会 drop 掉任务内的 RecvStream,向发送端发
     // STOP_SENDING,打断多文件会话的后续控制流(W2 教训)。
     let (manifest_tx, mut manifest_rx) = tokio::sync::mpsc::channel::<Manifest>(1);
-    let (finish_tx, mut finish_rx) = tokio::sync::mpsc::channel::<Result<Finish>>(1);
+    let (finish_tx, mut finish_rx) = tokio::sync::mpsc::unbounded_channel::<Result<Finish>>();
     let ctl_reader = tokio::spawn(async move {
         loop {
             match read_frame(&mut ctrl_rx, MAX_CTRL_FRAME).await {
@@ -282,12 +308,12 @@ async fn session_logic(
                     } else {
                         match serde_json::from_slice::<Finish>(&bytes) {
                             Ok(f) => {
-                                if finish_tx.send(Ok(f)).await.is_err() {
+                                if finish_tx.send(Ok(f)).is_err() {
                                     break;
                                 }
                             }
                             Err(e) => {
-                                let _ = finish_tx.send(Err(e.into())).await;
+                                let _ = finish_tx.send(Err(e.into()));
                                 break;
                             }
                         }
@@ -295,11 +321,9 @@ async fn session_logic(
                 }
                 Err(e) => {
                     // EOF(发送端全部传完并关闭)或错误 → 通道关闭 → 会话循环自然退出
-                    let _ = finish_tx
-                        .send(Err(anyhow::anyhow!(FtsError::Interrupted(format!(
-                            "控制流中断: {e}"
-                        )))))
-                        .await;
+                    let _ = finish_tx.send(Err(anyhow::anyhow!(FtsError::Interrupted(format!(
+                        "控制流中断: {e}"
+                    )))));
                     break;
                 }
             }
@@ -307,12 +331,23 @@ async fn session_logic(
     });
 
     // W2:多文件循环;任一文件失败即中止会话(与发送端快失败对齐)
+    let mut streams = StreamSource::Direct(data_src);
     let mut files_done = 0u32;
     let result = loop {
         let Some(manifest) = manifest_rx.recv().await else {
             break Ok(()); // 控制流结束 = 会话正常结束
         };
-        match handle_one_file(cfg, out, manifest, data_src, &mut ctrl_tx, &mut finish_rx).await {
+        match handle_one_file(
+            cfg,
+            out,
+            manifest,
+            None,
+            &ctl,
+            &mut finish_rx,
+            &mut streams,
+        )
+        .await
+        {
             Ok(()) => files_done += 1,
             Err(e) => break Err(e),
         }
@@ -326,14 +361,323 @@ async fn session_logic(
     result
 }
 
-/// 单文件:manifest 自检 → ticket → 续传 → Ack → 并行收流 → Finish → 校验 → 原子落盘 → FinishAck
+// ---------- v2 Concurrent 会话:槽位化多文件流水线 ----------
+
+/// 控制帧路由消息(接收端视角:Manifest/Finish 来自发送端)
+enum RouteMsg {
+    Manifest(u32, Manifest),
+    Finish(u32, Result<Finish>),
+    /// 控制流结束(正常 EOF 或断开):非协议错误,槽侧判 outcome
+    CtrlClosed,
+    /// 协议/路由错误:会话立即失败
+    Fatal(String),
+}
+
+/// 单文件的数据流来源:Direct = 原地 accept(Sequential);Piped = 槽通道(Concurrent)
+enum StreamSource {
+    Direct(DataInSource),
+    Piped(
+        tokio::sync::mpsc::UnboundedReceiver<BoxRead>,
+        Arc<AtomicU64>,
+    ),
+}
+
+impl StreamSource {
+    /// 下一条数据流;Piped 通道关闭返回 None
+    async fn next(&mut self) -> std::io::Result<Option<BoxRead>> {
+        match self {
+            StreamSource::Direct(d) => d.next_stream().await.map(Some),
+            StreamSource::Piped(rx, _) => Ok(rx.recv().await),
+        }
+    }
+
+    /// Piped 模式的槽级在途流计数;Direct 为 None
+    fn inflight(&self) -> Option<Arc<AtomicU64>> {
+        match self {
+            StreamSource::Direct(_) => None,
+            StreamSource::Piped(_, f) => Some(f.clone()),
+        }
+    }
+}
+
+/// 并发会话:控制帧按 slot 路由,数据流按 4 字节前导路由;任一槽失败即中止会话。
+///
+/// 结束判定:控制流读错误(EOF/断开)= 发送端关流 → 通知所有槽收尾(在途文件以
+/// Interrupted 失败,空闲槽自然退出); outcome 由槽任务结果决定,全部 Ok 且至少
+/// 完成一个文件才算会话成功(与 Sequential 对齐)。
+async fn session_concurrent(
+    cfg: &RecvCfg,
+    _out: &mut SessionOut,
+    ctl: Arc<Mutex<BoxWrite>>,
+    ctrl_rx: BoxRead,
+    data_src: DataInSource,
+) -> Result<()> {
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel::<RouteMsg>();
+    let reader = {
+        let route_tx = route_tx.clone();
+        tokio::spawn(async move {
+        let mut ctrl_rx = ctrl_rx;
+        loop {
+            match read_frame(&mut ctrl_rx, MAX_CTRL_FRAME).await {
+                Ok(bytes) => {
+                    if let Ok(m) = serde_json::from_slice::<Manifest>(&bytes) {
+                        let slot = m.slot.unwrap_or(u32::MAX);
+                        if route_tx.send(RouteMsg::Manifest(slot, m)).is_err() {
+                            break;
+                        }
+                    } else {
+                        match serde_json::from_slice::<Finish>(&bytes) {
+                            Ok(f) => {
+                                let slot = f.slot.unwrap_or(u32::MAX);
+                                if route_tx.send(RouteMsg::Finish(slot, Ok(f))).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                let _ = route_tx.send(RouteMsg::Fatal(e.to_string()));
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(_e) => {
+                    // 含正常 EOF(发送端全部传完关流)与连接断开:关路由,槽侧判 outcome
+                    let _ = route_tx.send(RouteMsg::CtrlClosed);
+                    break;
+                }
+            }
+        }
+        })
+    };
+
+    // Option 包装:控制流正常结束后 take+drop 释放全部槽发送半部(空闲槽退出)
+    let mut table: Option<Arc<StdMutex<HashMap<u32, Arc<SlotShared>>>>> =
+        Some(Arc::new(StdMutex::new(HashMap::new())));
+    let router = {
+        let table_router = table.as_ref().unwrap().clone();
+        let route_tx = route_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok(mut s) = data_src.next_stream().await else {
+                    break; // 会话已开始收尾(连接关闭);槽侧经由 CtrlClosed 判定
+                };
+                // v2 前导:[slot: u32 LE]
+                let mut pre = [0u8; SLOT_PREAMBLE];
+                if let Err(e) = s.read_exact(&mut pre).await {
+                    let _ = route_tx.send(RouteMsg::Fatal(format!("读槽位前导失败: {e}")));
+                    break;
+                }
+                let slot = match parse_slot_preamble(&pre) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = route_tx.send(RouteMsg::Fatal(e.to_string()));
+                        break;
+                    }
+                };
+                let handle = table_router.lock().unwrap().get(&slot).cloned();
+                let Some(h) = handle else {
+                    let _ = route_tx.send(RouteMsg::Fatal(format!("数据流指向未知槽位 {slot}")));
+                    break;
+                };
+                h.inflight.fetch_add(1, Ordering::Relaxed);
+                if h.stream_tx.send(s).is_err() {
+                    h.inflight.fetch_sub(1, Ordering::Relaxed);
+                    break; // 槽已关闭:会话在收尾
+                }
+            }
+        })
+    };
+    drop(route_tx); // reader/router 持有副本;全链路 drop 后 route_rx 关闭
+
+    let files_done = Arc::new(AtomicU64::new(0));
+    let mut set: JoinSet<Result<()>> = JoinSet::new();
+    let mut spawned: HashMap<u32, ()> = HashMap::new();
+    let mut route_open = true;
+    let mut first_err: Option<anyhow::Error> = None;
+    loop {
+        tokio::select! {
+            msg = route_rx.recv(), if route_open => {
+                match msg {
+                    None | Some(RouteMsg::CtrlClosed) => {
+                        // 控制流结束(EOF/断开):让槽收尾 —— 中途断开时在途槽经 finish 通道报错。
+                        // 先停 router(它持有 table 的 Arc,引用计数不归零 SlotShared 就不会 drop,
+                        // 槽任务的 manifest_rx 也就永远等不到 None)。
+                        router.abort();
+                        route_open = false;
+                        let slots: Vec<Arc<SlotShared>> = table
+                            .as_ref()
+                            .unwrap()
+                            .lock()
+                            .unwrap()
+                            .values()
+                            .cloned()
+                            .collect();
+                        for h in slots {
+                            let _ = h
+                                .finish_tx
+                                .send(Err(anyhow::anyhow!(FtsError::Interrupted(
+                                    "控制流已关闭".into()
+                                ))));
+                        }
+                        // 丢掉最后一个 Arc:空闲槽的 manifest_rx → None 正常退出
+                        drop(table.take());
+                    }
+                    Some(RouteMsg::Fatal(e)) => {
+                        first_err.get_or_insert_with(|| anyhow::anyhow!(FtsError::Interrupted(e)));
+                        break;
+                    }
+                    Some(RouteMsg::Manifest(slot, m)) => {
+                        if spawned.insert(slot, ()).is_none() {
+                            // 槽首帧:建共享半部 + 起槽任务。
+                            // 槽任务只拿接收半部与独立的 inflight Arc,不持 SlotShared 引用
+                            // (否则 session drop table 后引用计数不归零,槽永远等不到通道关闭)。
+                            let shared = Arc::new(SlotShared::new());
+                            let (mrx, frx, srx) = shared
+                                .rx_cell
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .expect("每槽只起一个 slot_loop");
+                            table
+                                .as_ref()
+                                .unwrap()
+                                .lock()
+                                .unwrap()
+                                .insert(slot, shared.clone());
+                            let _ = set.spawn(slot_loop(
+                                cfg.clone(),
+                                slot,
+                                mrx,
+                                frx,
+                                srx,
+                                shared.inflight.clone(),
+                                ctl.clone(),
+                                files_done.clone(),
+                            ));
+                        }
+                        let h = table.as_ref().unwrap().lock().unwrap().get(&slot).cloned();
+                        if let Some(h) = h {
+                            let _ = h.manifest_tx.send(m);
+                        }
+                    }
+                    Some(RouteMsg::Finish(slot, f)) => {
+                        let h = table.as_ref().unwrap().lock().unwrap().get(&slot).cloned();
+                        if let Some(h) = h {
+                            let _ = h.finish_tx.send(f);
+                        }
+                    }
+                }
+            }
+            done = set.join_next(), if !set.is_empty() => {
+                match done {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(e))) => {
+                        first_err.get_or_insert(e);
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        first_err.get_or_insert_with(|| anyhow::anyhow!("槽任务 panic: {e}"));
+                        break;
+                    }
+                    None => {}
+                }
+            }
+            else => break,
+        }
+    };
+
+    // 收尾:停 reader/router 与全部槽任务(出错快失败;正常 EOF 时槽已退,abort 是空操作)
+    reader.abort();
+    router.abort();
+    set.abort_all();
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    if files_done.load(Ordering::Relaxed) == 0 {
+        return Err(anyhow::anyhow!(FtsError::Interrupted(
+            "会话未传输任何文件".into()
+        )));
+    }
+    Ok(())
+}
+
+/// 槽共享半部(会话路由器写入,槽任务消费;接收半部由 slot_loop 一次性取走)
+struct SlotShared {
+    manifest_tx: tokio::sync::mpsc::UnboundedSender<Manifest>,
+    finish_tx: tokio::sync::mpsc::UnboundedSender<Result<Finish>>,
+    stream_tx: tokio::sync::mpsc::UnboundedSender<BoxRead>,
+    /// 已路由未完成的流数(router 入队前 +1,recv_stream 结束 -1)
+    inflight: Arc<AtomicU64>,
+    rx_cell: StdMutex<
+        Option<(
+            tokio::sync::mpsc::UnboundedReceiver<Manifest>,
+            tokio::sync::mpsc::UnboundedReceiver<Result<Finish>>,
+            tokio::sync::mpsc::UnboundedReceiver<BoxRead>,
+        )>,
+    >,
+}
+
+impl SlotShared {
+    fn new() -> Self {
+        let (manifest_tx, manifest_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (finish_tx, finish_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::unbounded_channel();
+        // 接收半部经 once 通道交给 slot_loop(持有者唯一)
+        let rx_cell = Some((manifest_rx, finish_rx, stream_rx));
+        SlotShared {
+            manifest_tx,
+            finish_tx,
+            stream_tx,
+            inflight: Arc::new(AtomicU64::new(0)),
+            rx_cell: StdMutex::new(rx_cell),
+        }
+    }
+}
+
+/// 槽任务:顺序处理本槽的文件(Manifest→…→FinishAck 循环),通道关闭即正常退出。
+/// 不持有 SlotShared 引用:会话收尾 drop table 后本任务的接收通道随之关闭。
+#[allow(clippy::too_many_arguments)]
+async fn slot_loop(
+    cfg: RecvCfg,
+    slot: u32,
+    mut manifest_rx: tokio::sync::mpsc::UnboundedReceiver<Manifest>,
+    mut finish_rx: tokio::sync::mpsc::UnboundedReceiver<Result<Finish>>,
+    stream_rx: tokio::sync::mpsc::UnboundedReceiver<BoxRead>,
+    inflight: Arc<AtomicU64>,
+    ctl: Arc<Mutex<BoxWrite>>,
+    files_done: Arc<AtomicU64>,
+) -> Result<()> {
+    let mut out = SessionOut::new(cfg.out);
+    if let Some(tx) = &cfg.events {
+        out = out.with_events(tx.clone());
+    }
+    let mut streams = StreamSource::Piped(stream_rx, inflight);
+    loop {
+        let Some(manifest) = manifest_rx.recv().await else {
+            return Ok(()); // 槽结束(会话收尾/全部传完)
+        };
+        match handle_one_file(&cfg, &mut out, manifest, Some(slot), &ctl, &mut finish_rx, &mut streams)
+            .await
+        {
+            Ok(()) => {
+                files_done.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// 单文件:manifest 自检 → ticket → 续传 → Ack → 并行收流 → Finish → 校验 → 原子落盘 → FinishAck。
+/// slot:None = Sequential(v1 字节级兼容);Some = Concurrent(Ack/FinishAck 带 slot,流带前导已由路由器消费)。
+#[allow(clippy::too_many_arguments)]
 async fn handle_one_file(
     cfg: &RecvCfg,
     out: &mut SessionOut,
     manifest: Manifest,
-    data_src: &DataInSource,
-    ctrl_tx: &mut BoxWrite,
-    finish_rx: &mut tokio::sync::mpsc::Receiver<Result<Finish>>,
+    slot: Option<u32>,
+    ctl: &Arc<Mutex<BoxWrite>>,
+    finish_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Result<Finish>>,
+    streams: &mut StreamSource,
 ) -> Result<()> {
     if manifest.checksum_algo != "blake3" {
         return Err(anyhow::anyhow!(FtsError::Version(format!(
@@ -357,26 +701,27 @@ async fn handle_one_file(
     }
 
     // W1:ticket → 落盘目录;拒绝时回 ManifestAck{ok:false, reason="AUTH: ..."}(发送端转退出码 7)
-    async fn deny_ack(ctrl_tx: &mut BoxWrite, reason: String) -> anyhow::Error {
+    async fn deny_ack(ctl: &Arc<Mutex<BoxWrite>>, reason: String) -> anyhow::Error {
         // 尽力通知对端(发送失败不影响本端错误上报)
         let payload = serde_json::to_vec(&ManifestAck {
             ok: false,
             reason: Some(format!("AUTH: {reason}")),
             resume_bitmap_hex: None,
+            slot: None,
         })
         .unwrap_or_default();
-        let _ = write_frame(ctrl_tx, &payload).await;
+        let _ = write_frame(&mut *ctl.lock().await, &payload).await;
         anyhow::anyhow!(FtsError::Auth(reason))
     }
     let base_dir: PathBuf = match &manifest.ticket {
         Some(ticket) => {
             let Some(reg) = &cfg.inbox else {
-                return Err(deny_ack(ctrl_tx, "本端未启用 inbox,ticket 无法兑换".into()).await);
+                return Err(deny_ack(ctl, "本端未启用 inbox,ticket 无法兑换".into()).await);
             };
             match reg.redeem(ticket, &manifest.file_name) {
                 Ok(dir) => dir,
                 Err(r) => {
-                    return Err(deny_ack(ctrl_tx, format!("ticket 拒绝: {r}")).await);
+                    return Err(deny_ack(ctl, format!("ticket 拒绝: {r}")).await);
                 }
             }
         }
@@ -433,6 +778,7 @@ async fn handle_one_file(
         ok: true,
         reason: None,
         resume_bitmap_hex: if resumed { Some(bitmap.to_hex()) } else { None },
+        slot,
     };
     out.log(&format!(
         "recv: {} ({} 字节, {} 块 × {}){}",
@@ -442,7 +788,7 @@ async fn handle_one_file(
         manifest.chunk_size,
         if resumed { " [续传]" } else { "" }
     ));
-    write_frame(ctrl_tx, &serde_json::to_vec(&ack)?).await?;
+    write_frame(&mut *ctl.lock().await, &serde_json::to_vec(&ack)?).await?;
     out.reset_started();
 
     let shared = Arc::new(Shared {
@@ -472,7 +818,7 @@ async fn handle_one_file(
             while done_flag.load(Ordering::Relaxed) == 0 {
                 let now = shared.verified_bytes.load(Ordering::Relaxed);
                 if now != last {
-                    out2.progress(Progress { bytes_done: now, bytes_total: total });
+                    out2.progress(Progress { bytes_done: now, bytes_total: total, job: None });
                     let bitmap = shared.bitmap.lock().await.clone();
                     let cp = Checkpoint {
                         file_name: shared.manifest.file_name.clone(),
@@ -489,18 +835,34 @@ async fn handle_one_file(
             }
             let now = shared.verified_bytes.load(Ordering::Relaxed);
             if now != last {
-                out2.progress(Progress { bytes_done: now, bytes_total: total });
+                out2.progress(Progress { bytes_done: now, bytes_total: total, job: None });
             }
         });
     }
 
+    let inflight = streams.inflight();
     let finish_received = loop {
         tokio::select! {
-            stream = data_src.next_stream() => {
+            stream = streams.next() => {
                 match stream {
-                    Ok(s) => {
+                    Ok(Some(s)) => {
                         let shared = shared.clone();
-                        tasks.spawn(async move { recv_stream(s, shared).await });
+                        let f = inflight.clone();
+                        tasks.spawn(async move {
+                            let r = recv_stream(s, shared).await;
+                            if let Some(f) = f {
+                                f.fetch_sub(1, Ordering::Relaxed);
+                            }
+                            r
+                        });
+                    }
+                    Ok(None) => {
+                        // Piped 槽通道已关闭 = 会话收尾
+                        done_flag.store(1, Ordering::Relaxed);
+                        let _ = tasks.join_next().await;
+                        return Err(anyhow::anyhow!(FtsError::Interrupted(
+                            "槽位数据流通道已关闭".into()
+                        )));
                     }
                     Err(e) => {
                         done_flag.store(1, Ordering::Relaxed);
@@ -531,17 +893,39 @@ async fn handle_one_file(
     done_flag.store(1, Ordering::Relaxed);
 
     // Finish 后补收:发送端先开满 N 条流、写完才发 Finish,但跨流无到达顺序保证,
-    // 上面的 select 可能先命中 Finish,把 accept 队列里尚未 accept 的流遗弃
+    // 上面的 select 可能先命中 Finish,把尚未消费的流遗弃
     // (实测:极小文件整个传输微秒级完成时触发"Finish 后仍有 1 块未收到")。
-    // 以"立即就绪"为准补收队列中的流,零延迟;真正在途的流本就等不到,交给下方位图校验兜底。
-    while let Ok(stream) = tokio::time::timeout(Duration::ZERO, data_src.next_stream()).await {
-        match stream {
-            Ok(s) => {
-                let shared = shared.clone();
-                tasks.spawn(async move { recv_stream(s, shared).await });
+    // Direct(Sequential):以"立即就绪"为准补收,零延迟;真正在途的流本就等不到,交给下方位图校验兜底。
+    // Piped(Concurrent):路由器入队即计数(inflight),等到计数归零即所有已路由流收尾,确定性强。
+    match streams {
+        StreamSource::Direct(d) => {
+            while let Ok(stream) = tokio::time::timeout(Duration::ZERO, d.next_stream()).await {
+                match stream {
+                    Ok(s) => {
+                        let shared = shared.clone();
+                        tasks.spawn(async move { recv_stream(s, shared).await });
+                    }
+                    Err(_) => break, // 连接已关闭:不再有新流
+                }
             }
-            Err(_) => break, // 连接已关闭:不再有新流
         }
+        StreamSource::Piped(rx, inflight) => loop {
+            let mut drained = 0usize;
+            while let Ok(s) = rx.try_recv() {
+                drained += 1;
+                let shared = shared.clone();
+                let f = inflight.clone();
+                tasks.spawn(async move {
+                    let r = recv_stream(s, shared).await;
+                    f.fetch_sub(1, Ordering::Relaxed);
+                    r
+                });
+            }
+            if drained == 0 && inflight.load(Ordering::Relaxed) == 0 {
+                break; // 已路由流全部收尾且无积压
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        },
     }
 
     // 等所有流任务收尾
@@ -596,10 +980,11 @@ async fn handle_one_file(
     ));
 
     write_frame(
-        ctrl_tx,
+        &mut *ctl.lock().await,
         &serde_json::to_vec(&FinishAck {
             checksum_ok: true,
             error: None,
+            slot,
         })?,
     )
     .await?;

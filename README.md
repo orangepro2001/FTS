@@ -78,6 +78,9 @@ fts daemon -c config.json --rest 127.0.0.1:6000   # CLI 参数覆盖配置文件
 # UDP 被封的环境:自动回退 TCP(或强制 --transport tcp)
 .\target\release\fts.exe send .\bigfile.bin --to <对端IP>:4433 --fingerprint <指纹> --transport tcp
 
+# 文件级并发(默认自动 4:多文件流水线 + 预读哈希,QUIC 下生效;大量小文件收益最大)
+.\target\release\fts.exe send .\myfolder --to <对端IP>:4433 --fingerprint <指纹> --file-concurrency 4
+
 # 脚本集成:NDJSON 事件 + 退出码
 .\target\release\fts.exe send .\bigfile.bin --to <IP>:4433 --fingerprint <指纹> --json
 if ($LASTEXITCODE -ne 0) { throw "传输失败: $LASTEXITCODE" }  # 4 = 校验失败,数据不可信
@@ -87,9 +90,11 @@ if ($LASTEXITCODE -ne 0) { throw "传输失败: $LASTEXITCODE" }  # 4 = 校验�
 
 ```
 fts send <PATH>... --to <ADDR> [--fingerprint <HEX> | --insecure] [--streams N]
-              [--chunk-size B] [--transport auto|quic|tcp] [--ticket <T>] [--json]
+              [--file-concurrency N] [--chunk-size B] [--transport auto|quic|tcp]
+              [--ticket <T>] [--json]
               # 多路径/目录(目录递归展开,子目录结构在接收端原样重建;
               # 相对路径重复 → 退出码 2;空目录不重建;目录符号链接不递归)
+              # --file-concurrency 0 = 自动 4:QUIC 且对端支持时多文件流水线,TCP 自动串行
 fts recv --listen <ADDR> [--out DIR] [--transport auto|quic|tcp] [--cert-cache DIR] [--json]
 fts daemon [--rest 127.0.0.1:5050] [--listen 0.0.0.0:4433] [--out DIR]
            [--cert-cache DIR] [--max-sessions 3] [--grpc 127.0.0.1:50051]

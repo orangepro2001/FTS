@@ -9,6 +9,11 @@ orch/fts_pb2_grpc.py
 orch/config.local.json
 orch/config.json
 
+# 项目地图(repomix 生成物,本地刷新)
+/repomix-output.md
+/inbox_g
+/inbox_v2
+
 # updater GUI(构建产物与依赖,源码入库)
 updater/node_modules/
 updater/webdist/

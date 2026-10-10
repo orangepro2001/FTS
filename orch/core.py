@@ -123,6 +123,7 @@ class Task:
     transport: str = ""
     streams: int = 0
     chunk_size: int = 0
+    file_concurrency: int = 0
     purge: bool = False
     # —— 运行时 ——
     source_task_id: str = ""
@@ -167,6 +168,7 @@ class Task:
             "transport": self.transport,
             "streams": self.streams,
             "chunk_size": self.chunk_size,
+            "file_concurrency": self.file_concurrency,
             "purge": self.purge,
             "purge_files": self.purge_files,
             "purge_dirs": self.purge_dirs,
@@ -277,6 +279,9 @@ class Orchestrator:
             transport=kw.get("transport", self.defaults.get("transport", "auto")),
             streams=int(kw.get("streams", self.defaults.get("streams", 0)) or 0),
             chunk_size=int(kw.get("chunk_size", self.defaults.get("chunk_size", 0)) or 0),
+            file_concurrency=int(
+                kw.get("file_concurrency", self.defaults.get("file_concurrency", 0)) or 0
+            ),
             purge=bool(kw.get("purge", False)),
         )
         self.tasks[task.id] = task
@@ -356,6 +361,7 @@ class Orchestrator:
                             streams=task.streams,
                             chunk_size=task.chunk_size,
                             transport=task.transport or "",
+                            file_concurrency=task.file_concurrency,
                         )
                     ),
                     timeout=self.rpc_timeout,

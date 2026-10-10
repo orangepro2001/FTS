@@ -83,6 +83,8 @@ pub struct DaemonCfg {
     pub grpc: Option<std::net::SocketAddr>,
     /// W9:启动用的 config 路径(空 = 无;BeginUpdate 透传给 apply-update 重启用)
     pub config_path: PathBuf,
+    /// v2:QUIC 流/连接接收窗口(MiB;config 可调,默认 32)
+    pub quic_window_mib: u32,
 }
 
 /// 配置文件(fts daemon --config <PATH>):全部字段可选,未提供的回落 CLI/默认值。
@@ -95,6 +97,8 @@ pub struct FileConfig {
     pub out_dir: Option<PathBuf>,
     pub cert_cache: Option<PathBuf>,
     pub max_sessions: Option<usize>,
+    /// v2:QUIC 接收窗口(MiB;默认 32)
+    pub quic_window_mib: Option<u32>,
 }
 
 pub fn load_file_config(path: &PathBuf) -> Result<FileConfig, crate::error::FtsError> {
@@ -108,7 +112,15 @@ pub fn load_file_config(path: &PathBuf) -> Result<FileConfig, crate::error::FtsE
 
 /// 目录可写预检:启动与 inbox 注册时快速失败,附网络路径提示。
 pub fn precheck_dir(dir: &PathBuf) -> Result<(), crate::error::FtsError> {
-    std::fs::create_dir_all(dir).map_err(crate::error::FtsError::io_with_hint)?;
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        // std::fs::create_dir_all 对 UNC 会吞掉真实 OS 错误(NotFound 递归到根后
+        // 返回 const "failed to create whole tree",无 OS 码)—— 单层 mkdir 重取
+        // 原始错误,凭据/权限诊断(1326/5/53/67)才有据可依。
+        if let Err(e2) = std::fs::create_dir(dir) {
+            return Err(crate::error::FtsError::io_with_hint(e2));
+        }
+        return Err(crate::error::FtsError::io_with_hint(e));
+    }
     let probe = dir.join(".fts-write-probe");
     std::fs::write(&probe, b"ok").map_err(crate::error::FtsError::io_with_hint)?;
     let _ = std::fs::remove_file(&probe);
@@ -324,6 +336,7 @@ pub async fn run(cfg: DaemonCfg) -> Result<(), crate::error::FtsError> {
             cert_cache: cfg.cert_cache.clone(),
             events: None,
             inbox: Some(inbox.clone()),
+            quic_window_mib: cfg.quic_window_mib,
         };
         let max_sessions = cfg.max_sessions;
         tokio::spawn(async move {
@@ -425,6 +438,8 @@ struct SubmitReq {
     transport: Option<String>,
     /// W1 inbox 票据(经 /v1/inbox 获取;决定对端落盘目录)
     ticket: Option<String>,
+    /// v2 文件级并发(缺省/0 = 自动 4;仅 QUIC 且对端支持时生效)
+    file_concurrency: Option<u32>,
 }
 
 /// W1:预注册接收目录 → 一次性 token(W6:可携带网络凭据,fts 代建 SMB 会话)
@@ -584,6 +599,7 @@ async fn submit(
         ticket: req.ticket.clone(),
         out: Output::Silent,
         events: Some(events_tx.clone()),
+        file_concurrency: req.file_concurrency.unwrap_or(0),
     };
 
     let st = state.clone();

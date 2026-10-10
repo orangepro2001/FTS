@@ -160,6 +160,12 @@ impl Fts for GrpcService {
             ticket: if r.ticket.is_empty() { None } else { Some(r.ticket.clone()) },
             out: Output::Silent,
             events: Some(events_tx.clone()),
+            // 0 = auto(4,发送端解析);其余 clamp 1..=16
+            file_concurrency: if r.file_concurrency == 0 {
+                0
+            } else {
+                r.file_concurrency.clamp(1, 16)
+            },
         };
 
         let st = state.clone();

@@ -28,6 +28,83 @@
 
 ---
 
+## 2026-10-10(2):发布 0.2.0 并全网推送(8/8 成功)
+
+版本 0.1.0 → 0.2.0(Cargo.toml;`build.ps1` 出 dist,VERSION=0.2.0)。对 `orch/config.json` 全部 8 台 endpoint 探活:8/8 存活(v0.1.0)。
+
+### 踩坑与手法:跨协议版本的首跳升级
+
+- **现象**:0.2.0 本机发送端直推 0.1.0 目标,8 台全部 0.02s `FAILED early eof`。根因:push-update 的推送本身是一次 fts 传输,v2 Hello 握手被 v1 接收端 `check_hello` 严格相等拒绝 —— 协议演进隔断了自身的推送通道(先有鸡先有蛋)。
+- **手法**:从 git 根提交 `13aa3fc`(0.1.0)`git worktree add` 检出旧树构建**引导版 fts.exe**,以 v1 发送端对 v1 接收端逐台推 0.2.0 dist(传输兼容;BeginUpdate 后目标拉起 0.2.0 apply-update,参数格式本轮未动,兼容)。今后任何跨协议大版本首跳都用这一招:老版本 exe 当引导推送器。
+- **结果**:8/8 `更新成功: 0.1.0 → 0.2.0(重启确认)`,started_at 全部刷新;独立复验 8/8 v0.2.0。
+- **v2 真实内网首验**:本机 0.2.0 sender → 192.168.1.60 daemon(QUIC + 指纹 pin + inbox ticket,4MB)COMPLETED —— v2 并发流水线在物理网络打通。
+
+失败尝试在各目标 `.fts\update\stage-1791636256` 留有半成品(后续成功推送用了新时间戳 stage,无影响;可手工清理)。
+
+---
+
+
+## 2026-10-10:fts-more-fast —— 文件级并发传输(协议 v2:槽位化多文件流水线)
+
+设计:`plan/fts-more-fast.md`(收益诚实版:不提链路吞吐,消文件间串行;hash-ahead 独立生效)。地图 `repomix-output.md`(2026-10-08)。
+
+### 落地内容
+
+- **protocol.rs v2**:`PROTOCOL_VERSION = 2`;`Hello.caps`(bit0=MULTIFILE,serde default 向后兼容);`Manifest/ManifestAck/Finish/FinishAck.slot: Option<u32>`(skip 序列化,None 时字节级 = v1);数据流 v2 前导 `[slot: u32 LE]`;`TransferMode` + `negotiate_mode`(QUIC 且对端 MULTIFILE → Concurrent,两端各自推导,无协商帧);单测:协商矩阵 / v1 帧向后反序列化 / 前导往返。
+- **recv.rs 槽位路由**:Concurrent 会话 = ctl reader 按 slot 路由 + 数据流 router 读前导路由到 `HashMap<u32, Arc<SlotShared>>`;每槽独立 `slot_loop`(Manifest→Ack→收流→Finish→校验→原子落盘→FinishAck 循环);Sequential 原路径不动。Finish 后补收:Piped 用槽级 inflight 计数(router 入队前 +1,recv_stream 结束 -1),归零即所有已路由流收尾。
+- **send.rs 管道化**:hash-ahead 生产者(有界 mpsc K+1,预读哈希藏进前一文件传输窗口)+ K 个 worker(固定槽位,共享 prep 队列)+ 控制读 router(按 slot 路由 Ack/FinishAck,None→0 兼容 Sequential);控制写 = `Arc<Mutex<BoxWrite>`(整帧原子);快失败 = JoinSet 首个 Err → abort_all。作业级进度:流任务 fetch_add 进 `JobCounters`,`progress` 事件追加 `job` 对象(additive)。
+- **接口**:CLI `--file-concurrency`(0=自动 4)+ 修 main.rs 过期帮助文案(目录其实是递归展开,W8);REST `SubmitReq.file_concurrency`;gRPC `TransferRequest.file_concurrency = 15`(clamp 1..=16);FFI/update.rs 补字段不扩 ABI;`FileConfig.quic_window_mib`(默认 32)贯通到 quinn 传输窗口;orch core.py defaults 透传 + `config.example.json`;proto 重生成 stub(orch + tests 运行时自生成)。
+
+### 实测(loopback,e2e `tests/multi_file_concurrency.py`)
+
+- T1:20 文件混合大小(嵌套目录)一次发送 → COMPLETED + checksum_ok + 树逐字节一致;**并发生效断言:第 2 个 file 事件先于第 1 个 file_done**;~139 MB/s(12.9MB/0.09s)。
+- T2:中途杀 sender → 重发自动续传 → COMPLETED、树一致、无 .fts-part 残留。
+- T3:杀 sender(TCP 强制)→ recv 会话 15s 内退出不挂死(QUIC 静默掉线依赖 idle timeout,当前实现等超时,与 v1 一致,不在本轮范围)。
+- daemon 自传压测:5 连发(含同名替换 600MB)全部 COMPLETED;600MB 2.6~3.0s(~210-230 MB/s);grpc_smoke 300MB T9 PASS。
+
+### 揪出的两个既有缺陷(本轮修复)
+
+1. **会话 permit 泄漏(W2 遗留)**:接收端成功路径 gate `conn.closed().await` 无界等发送端关连接。daemon 自传(自己提交给自己)时发送端只 drop 连接句柄,close 帧不保证发出 → gate 永不 resolve → `max_sessions` 个 permit 被占光 → 第 N+1 个任务被信号量饿死(QUIC Incoming 无人受理 → 发送端 4s 超时降级 TCP → TCP 也停在 backlog)。修复:发送端 Ok 路径显式 `conn.close(0)`;接收端 gate 加 30s 上界兜底(客户端崩溃场景)。
+2. **并发会话收尾自锁(本轮引入,诊断中抓到)**:slot_loop 持有 `Arc<SlotShared>`,session drop 槽表后引用计数不归零 → 槽的 manifest_tx 永不 drop → 槽任务永远等不到通道关闭 → 同样拖死 permit。修复:slot_loop 只拿接收半部 + 独立 inflight Arc,不持 SlotShared;收尾先 `router.abort()`(router 也持表引用)再 drop 槽表。
+
+教训:tokio Semaphore 的 permit 泄漏不会报错,只会在第 N+1 个并发单元静默饿死 —— **并发上限类资源必须在"会话任务必然退出"上建立闭环论证**,不能依赖对端行为(gate 等对端 close 就是对端行为)。
+
+### 测法与记录
+
+- 单轮 e2e:`python tests\multi_file_concurrency.py`(前置 `cargo build --release`;自动找 exe;测完自清理)。
+- daemon 自传:`fts daemon --config <tmp>` + `python tests\grpc_smoke.py <指纹> <大文件>`(T9 的 progress 断言需传输 >1s,loopback 上 <48MB 的文件跑不满 1s 属预期,不算失败)。
+- 真实倍数(万兆/NVMe ≈1.3~1.4×,大量小文件 ≈1.5~3×)需物理内网两台机器,测法:同目录树各传 3 次取中位数,对比 `--file-concurrency 1` 与默认 4。
+
+---
+
+## 2026-10-06(6):凭据问题确认 —— "中途被卡住"不可能,失败即停 + 提示完善
+
+集成方问题:目标方 SMB 访问不通(要求凭据)时 fts 能否正常工作?会否中途被凭据卡住?
+
+### 结论(已实测)
+
+**不会被中途卡住。** fts 是控制台/服务程序,Windows 凭据 UI(弹框)只属于 Explorer,fts 的所有文件操作失败都直接返回 OS 错误。凭据问题只出现在**两个明确的同步检查点**,不发生在传输中途:
+
+1. **daemon 启动**(precheck_dir):坏目录 → 启动即退出(退出码 1),实测不可达 UNC 返回 `os error 53 — 提示:找不到网络路径…`,不挂起。
+2. **ReserveInbox 注册**(REST/gRPC):无凭据 → precheck 立即 400 + 提示;带 credential 但凭据错 → netcred 立即 400(WNet 1203/1326/5 均有映射)。实测不存在的主机:带凭据返回 `WNet 错误 1203`,不带返回 `os error 53 + 提示`,全部同步、无挂起。
+3. **传输过程中**(每个文件落盘前):目录已由预检建立,凭据已生效;传输中唯一可能的新失败是网络断开 → 按普通中断处理(checkpoint 保留),同样无弹窗。
+
+发送端访问"自己的资源"(本地源文件)与凭据无关,天然不受影响。
+
+### 本次修复(实测暴露的两个提示缺陷)
+
+1. **io_with_hint 不下探 source 链**:`create_dir_all` 等包 context 后 OS 码在链里;且 `io::Error::source()` **不透传内层错误**(标准库怪癖),必须用 `get_ref().downcast_ref::<io::Error>()` 逐层下探。
+2. **create_dir_all 吞 UNC 真实错误**:NotFound 时递归到根后返回 const "failed to create whole tree"(无 OS 码)—— precheck_dir 失败时用单层 `std::fs::create_dir` 重取原始 OS 错误再翻译。
+3. netcred 补 1203(无网络提供程序接受路径)映射。
+
+### 验证
+
+- daemon `--out \\no-such-host-xyz\share` → 启动即退出 1 + 53 提示 ✅(修复前只有 "failed to create whole tree")
+- REST inbox:坏主机 + 凭据 → `WNet 错误 1203`;坏主机无凭据 → `53 + 提示` ✅ 均同步返回
+- 单测 26/26(io_hint source 链下探用例)
+
+---
+
 ## 2026-10-06(5):W9 远程更新器 —— BeginUpdate 自替换 + push-update + Tauri GUI(填 IP 一键换版)
 
 设计文档:**plan/fts-updater-design.md**(架构图、决策表、踩坑明细都在那里,此处只记要点)。
